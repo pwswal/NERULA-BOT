@@ -239,7 +239,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <div class="container">
 <div class="card">
 <h2>Discord Bot</h2>
-<p style="margin-bottom:1rem">Start or stop the Discord bot.</p>
+<p style="margin-bottom:1rem">Status: <span id="statusText" style="font-weight:bold;color:#ff6b6b">Loading...</span></p>
 <button class="btn btn-green" id="startBtn" onclick="startBot()">Start</button>
 <button class="btn btn-red" id="stopBtn" onclick="stopBot()" disabled>Stop</button>
 <div class="msg" id="msg"></div>
@@ -258,10 +258,16 @@ async function loadStatus(){
 try{
 const r=await fetch('/api/discord/status');
 const j=await r.json();
-document.getElementById('startBtn').disabled=j.running;
+document.getElementById('startBtn').disabled=j.running||j.starting;
 document.getElementById('stopBtn').disabled=!j.running;
-if(j.channels&&j.channels.length){
+const st=document.getElementById('statusText');
+if(j.running){st.textContent='Online';st.style.color='#4ade80';}
+else if(j.starting){st.textContent='Starting...';st.style.color='#facc15';}
+else{st.textContent='Offline';st.style.color='#ff6b6b';}
+if(j.error){show('',j.error);}
 const sel=document.getElementById('channelSelect');
+sel.innerHTML='<option value="">Select channel...</option>';
+if(j.channels&&j.channels.length){
 j.channels.forEach(c=>{
 const o=document.createElement('option');
 o.value=c.id;o.textContent='#'+c.name;
@@ -273,25 +279,30 @@ sel.appendChild(o);
 }
 async function startBot(){
 show('Starting...','');
+document.getElementById('startBtn').disabled=true;
 try{
 const r=await fetch('/api/discord/start',{method:'POST'});
 const j=await r.json();
-if(j.ok)show('Bot started!','');
-else show('',j.error||'Failed');
-setTimeout(loadStatus,3000);
+if(j.ok){show('Bot is starting...','');}
+else{show('',j.error||'Failed to start');}
+setTimeout(loadStatus,4000);
 }catch(e){show('','Network error');}
 }
 async function stopBot(){
 try{
 const r=await fetch('/api/discord/stop',{method:'POST'});
 const j=await r.json();
-show('Bot stopped','');
+show(j.msg||'Stopped','');
 setTimeout(loadStatus,2000);
 }catch(e){show('','Network error');}
 }
 async function setChannel(){
 const ch=document.getElementById('channelSelect').value;
-try{await fetch('/api/discord/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch})});}catch(e){}
+try{
+const r=await fetch('/api/discord/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch})});
+const j=await r.json();
+if(j.ok)show('Channel saved!','');
+}catch(e){}
 }
 function show(m,e){
 const ms=document.getElementById('msg'),er=document.getElementById('err');
@@ -300,6 +311,7 @@ ms.style.display=m?'block':'none';
 er.style.display=e?'block':'none';
 }
 loadStatus();
+setInterval(loadStatus,5000);
 </script>
 </body>
 </html>"""
@@ -456,11 +468,14 @@ _discord_ready = asyncio.Event()
 _activity: list = []
 _receipts: dict = {}
 _pending_buys: dict = {}
+_last_error: str = ""
 
 async def _discord_log(msg: str):
     _activity.append({"time": datetime.now().strftime("%H:%M"), "msg": msg})
     if len(_activity) > 100:
         _activity.pop(0)
+    if not _discord_client or not _discord_client.is_ready():
+        return
     if not CONFIG.get("log_channel"):
         return
     try:
@@ -481,27 +496,26 @@ def _build_receipt(user_id, plan, amount):
     }
     return order_id
 
-def _get_discord_client():
-    global _discord_client
-    if _discord_client is not None:
-        return _discord_client
-
+def _create_discord_client():
     intents = discord.Intents.default()
     intents.message_content = True
     intents.members = True
 
-    _discord_client = discord.Client(intents=intents)
-    tree = app_commands.CommandTree(_discord_client)
+    client = discord.Client(intents=intents)
+    tree = app_commands.CommandTree(client)
 
-    @_discord_client.event
+    @client.event
     async def on_ready():
         global _discord_ready
+        try:
+            synced = await tree.sync()
+            logger.info(f"Synced {len(synced)} commands")
+        except Exception as e:
+            logger.error(f"Failed to sync commands: {e}")
         _discord_ready.set()
-        await tree.sync()
-        await _discord_log(f"Bot online — {_discord_client.user}")
-        logger.info(f"Discord bot ready: {_discord_client.user}")
+        logger.info(f"Discord bot ready: {client.user} (ID: {client.user.id})")
+        await _discord_log(f"Bot online — {client.user}")
 
-    # ── /setup command ──
     @tree.command(name="setup", description="Open VPN config panel")
     async def setup_cmd(interaction: discord.Interaction):
         view = discord.ui.View(timeout=None)
@@ -536,13 +550,13 @@ def _get_discord_client():
                     )
                     if uid:
                         try:
-                            u = await _discord_client.fetch_user(int(uid))
+                            u = await client.fetch_user(int(uid))
                             await u.send(admin_msg)
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"Could not DM admin: {e}")
                     if CONFIG.get("log_channel"):
                         try:
-                            ch = _discord_client.get_channel(int(CONFIG["log_channel"]))
+                            ch = client.get_channel(int(CONFIG["log_channel"]))
                             if ch:
                                 await ch.send(admin_msg)
                         except:
@@ -582,19 +596,17 @@ def _get_discord_client():
             ephemeral=True,
         )
 
-    # ── /status command ──
     @tree.command(name="status", description="Show bot status")
     async def status_cmd(interaction: discord.Interaction):
-        guilds = len(_discord_client.guilds) if _discord_client.is_ready() else 0
-        users = sum(g.member_count or 0 for g in _discord_client.guilds) if _discord_client.is_ready() else 0
+        g = len(client.guilds) if client.is_ready() else 0
+        u = sum(m.member_count or 0 for m in client.guilds) if client.is_ready() else 0
         await interaction.response.send_message(
-            f"**Status:** {'Online' if _discord_client.is_ready() else 'Offline'}\n"
-            f"**Guilds:** {guilds}\n**Users:** {users}",
+            f"**Status:** {'Online' if client.is_ready() else 'Offline'}\n"
+            f"**Guilds:** {g}\n**Users:** {u}",
             ephemeral=True,
         )
 
-    # ── approval buttons ──
-    @_discord_client.event
+    @client.event
     async def on_message(message):
         if message.author.bot:
             return
@@ -604,72 +616,88 @@ def _get_discord_client():
             return
 
         content = message.content.strip()
-        # Check for approve/reject by order ID
         for oid, buy in list(_pending_buys.items()):
             if oid in content:
                 lower = content.lower()
-                if "approve" in lower or "/approve" in lower:
+                if "approve" in lower:
                     order = _receipts.get(oid, {})
                     uid = buy["user_id"]
                     try:
-                        u = await _discord_client.fetch_user(int(uid))
+                        u = await client.fetch_user(int(uid))
                         await u.send(f"Order `{oid}` approved!\nPlan: **{buy['plan']}**\n\nYour config is being prepared.")
                     except:
                         pass
                     del _pending_buys[oid]
                     order["status"] = "approved"
                     await _discord_log(f"Approved: {oid}")
-                elif "reject" in lower or "/reject" in lower:
+                    await message.add_reaction("\u2705")
+                elif "reject" in lower:
                     uid = buy["user_id"]
                     try:
-                        u = await _discord_client.fetch_user(int(uid))
+                        u = await client.fetch_user(int(uid))
                         await u.send(f"Order `{oid}` was rejected.\nContact support for details.")
                     except:
                         pass
                     del _pending_buys[oid]
                     _receipts[oid]["status"] = "rejected"
                     await _discord_log(f"Rejected: {oid}")
+                    await message.add_reaction("\u274c")
 
-        # Handle receipt image upload
-        if message.attachments:
-            for att in message.attachments:
-                if att.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-                    await _discord_log(f"Receipt uploaded by {message.author}: {att.filename}")
-
-    return _discord_client
+    return client
 
 
 async def start_discord_bot():
-    global _discord_task, _discord_ready
+    global _discord_task, _discord_ready, _discord_client, _last_error
     if _discord_task and not _discord_task.done():
-        return
+        return {"ok": False, "error": "Already running"}
     if not CONFIG.get("bot_token"):
-        return
+        return {"ok": False, "error": "Bot token not set. Go to Settings and add your token."}
     _discord_ready.clear()
-    client = _get_discord_client()
+    _last_error = ""
+    _discord_client = _create_discord_client()
+
     async def _run():
+        global _last_error
         try:
-            await client.start(CONFIG["bot_token"])
+            await _discord_client.start(CONFIG["bot_token"])
+        except discord.LoginFailure:
+            _last_error = "Invalid bot token"
+            logger.error("Discord login failed: invalid token")
         except Exception as e:
+            _last_error = str(e)
             logger.error(f"Discord error: {e}")
+
     _discord_task = asyncio.create_task(_run())
     try:
         await asyncio.wait_for(_discord_ready.wait(), timeout=30)
-    except:
-        pass
+        return {"ok": True, "msg": "Bot started"}
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": _last_error or "Bot failed to connect within 30s"}
 
 async def stop_discord_bot():
     global _discord_task, _discord_client, _discord_ready
     if _discord_task and not _discord_task.done():
         _discord_task.cancel()
-    if _discord_client and _discord_client.is_ready():
-        await _discord_client.close()
+        try:
+            await _discord_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    if _discord_client:
+        try:
+            if _discord_client.is_ready():
+                await _discord_client.close()
+            elif not _discord_client.is_closed():
+                await _discord_client.close()
+        except:
+            pass
     _discord_client = None
     _discord_task = None
     _discord_ready.clear()
+    return {"ok": True, "msg": "Bot stopped"}
 
 def discord_status():
     running = _discord_client is not None and _discord_client.is_ready()
+    starting = _discord_task is not None and not _discord_task.done() and not running
     guilds = len(_discord_client.guilds) if running else 0
     users = sum(g.member_count or 0 for g in _discord_client.guilds) if running else 0
     channels = []
@@ -683,10 +711,12 @@ def discord_status():
                 })
     return {
         "running": running,
+        "starting": starting,
         "guilds": guilds,
         "users": users,
         "channels": channels,
         "activity": _activity[-20:],
+        "error": _last_error if not running and _last_error else None,
     }
 
 # ══════════════════════════════════════════════════════════════
@@ -771,15 +801,15 @@ async def discord_status_api(request: Request):
 async def discord_start(request: Request):
     if not await check_auth(request):
         return JSONResponse({"ok": False}, status_code=401)
-    asyncio.create_task(start_discord_bot())
-    return {"ok": True, "msg": "Starting..."}
+    result = await start_discord_bot()
+    return result
 
 @app.post("/api/discord/stop")
 async def discord_stop(request: Request):
     if not await check_auth(request):
         return JSONResponse({"ok": False}, status_code=401)
-    asyncio.create_task(stop_discord_bot())
-    return {"ok": True, "msg": "Stopping..."}
+    result = await stop_discord_bot()
+    return result
 
 @app.post("/api/discord/channel")
 async def set_channel(request: Request):
